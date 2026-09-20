@@ -21,8 +21,14 @@ func OpenDatabase(path string, opts *bolt.Options) (*Database, error) {
 	return DatabaseFromBoltDB(db)
 }
 
-// Close closes the underlying Bolt database.
+// Close syncs pending writes to disk and closes the underlying Bolt
+// database. Syncing before close guards against data loss for large
+// database files, where dirty pages may still be in the page cache.
 func (db *Database) Close() error {
+	if err := db.bolt.Sync(); err != nil {
+		return fmt.Errorf("bolt: failed to sync database before close: %w", err)
+	}
+
 	return db.bolt.Close()
 }
 

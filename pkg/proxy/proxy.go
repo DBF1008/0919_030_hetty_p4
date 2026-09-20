@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/oklog/ulid"
@@ -31,11 +32,20 @@ const reqIDKey contextKey = 0
 type Proxy struct {
 	certConfig *CertConfig
 	handler    http.Handler
+	transport  *http.Transport
 	logger     log.Logger
 
 	// TODO: Add mutex for modifier funcs.
 	reqModifiers []RequestModifyMiddleware
 	resModifiers []ResponseModifyMiddleware
+
+	// mu guards conns and closed. conns tracks hijacked CONNECT tunnel
+	// connections so they can be closed on shutdown; http.Server.Shutdown
+	// does not close hijacked connections.
+	mu     sync.Mutex
+	conns  map[net.Conn]struct{}
+	closed bool
+	wg     sync.WaitGroup
 }
 
 type Config struct {
@@ -55,6 +65,7 @@ func NewProxy(cfg Config) (*Proxy, error) {
 		certConfig:   certConfig,
 		reqModifiers: make([]RequestModifyMiddleware, 0),
 		resModifiers: make([]ResponseModifyMiddleware, 0),
+		conns:        make(map[net.Conn]struct{}),
 		logger:       cfg.Logger,
 	}
 
@@ -85,8 +96,68 @@ func NewProxy(cfg Config) (*Proxy, error) {
 		ModifyResponse: p.modifyResponse,
 		ErrorHandler:   p.errorHandler,
 	}
+	p.transport = transport
 
 	return p, nil
+}
+
+// Close releases resources held by the proxy. It closes idle connections in
+// the underlying transport and closes any active CONNECT tunnel connections,
+// waiting for their handlers to return. It is safe to call Close multiple
+// times; subsequent calls are no-ops.
+func (p *Proxy) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+
+	conns := make([]net.Conn, 0, len(p.conns))
+	for conn := range p.conns {
+		conns = append(conns, conn)
+	}
+	p.mu.Unlock()
+
+	// Release idle keep-alive connections held by the transport.
+	p.transport.CloseIdleConnections()
+
+	// Close hijacked CONNECT tunnel connections; http.Server.Shutdown does
+	// not close these, so clients would otherwise wait indefinitely.
+	for _, conn := range conns {
+		conn.Close()
+	}
+
+	// Wait for CONNECT handlers to return.
+	p.wg.Wait()
+
+	return nil
+}
+
+// trackConn registers conn as an active tunnel connection. It returns false
+// if the proxy is closed, in which case the caller should not use conn.
+func (p *Proxy) trackConn(conn net.Conn) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.closed {
+		return false
+	}
+
+	p.conns[conn] = struct{}{}
+	p.wg.Add(1)
+
+	return true
+}
+
+// untrackConn deregisters conn, which must have been registered with
+// trackConn.
+func (p *Proxy) untrackConn(conn net.Conn) {
+	p.mu.Lock()
+	delete(p.conns, conn)
+	p.mu.Unlock()
+
+	p.wg.Done()
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -196,7 +267,18 @@ func (p *Proxy) handleConnect(w http.ResponseWriter) {
 
 		return
 	}
-	defer clientConn.Close()
+
+	// Register the tunnel connection so it gets closed on proxy shutdown.
+	// The HTTP server does not track hijacked connections, so without this
+	// a connected client would never be notified when the server exits.
+	if !p.trackConn(clientConn) {
+		clientConn.Close()
+		return
+	}
+	defer func() {
+		p.untrackConn(clientConn)
+		clientConn.Close()
+	}()
 
 	// Secure connection to client.
 	tlsConn, err := p.clientTLSConn(clientConn)

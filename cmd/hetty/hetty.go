@@ -14,12 +14,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/chromedp/chromedp"
 	"github.com/gorilla/mux"
 	"github.com/mitchellh/go-homedir"
 	"github.com/peterbourgon/ff/v3/ffcli"
-	"go.etcd.io/bbolt"
 	"go.uber.org/zap"
 
 	"github.com/dstotijn/hetty/pkg/api"
@@ -154,10 +154,10 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 	}
 
 	dbLogger := cmd.config.logger.Named("boltdb").Sugar()
-	boltOpts := *bbolt.DefaultOptions
+	boltOpts := bolt.DefaultOptions()
 	boltOpts.Logger = &bolt.Logger{SugaredLogger: dbLogger}
 
-	boltDB, err := bolt.OpenDatabase(dbPath, &boltOpts)
+	boltDB, err := bolt.OpenDatabase(dbPath, boltOpts)
 	if err != nil {
 		cmd.config.logger.Fatal("Failed to open database.", zap.Error(err))
 	}
@@ -188,7 +188,9 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 		Scope:            scope,
 	})
 	if err != nil {
-		cmd.config.logger.Fatal("Failed to create new projects service.", zap.Error(err))
+		// Note: return an error instead of logger.Fatal, so deferred
+		// cleanup (e.g. boltDB.Close) is executed.
+		return fmt.Errorf("failed to create new projects service: %w", err)
 	}
 
 	proxy, err := proxy.NewProxy(proxy.Config{
@@ -197,7 +199,7 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 		Logger: cmd.config.logger.Named("proxy").Sugar(),
 	})
 	if err != nil {
-		cmd.config.logger.Fatal("Failed to create new proxy.", zap.Error(err))
+		return fmt.Errorf("failed to create new proxy: %w", err)
 	}
 
 	proxy.UseRequestModifier(reqLogService.RequestModifier)
@@ -207,7 +209,7 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 
 	fsSub, err := fs.Sub(adminContent, "admin")
 	if err != nil {
-		cmd.config.logger.Fatal("Failed to construct file system subtree from admin dir.", zap.Error(err))
+		return fmt.Errorf("failed to construct file system subtree from admin dir: %w", err)
 	}
 
 	adminHandler := http.FileServer(http.FS(fsSub))
@@ -251,15 +253,33 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 		ErrorLog:     zap.NewStdLog(cmd.config.logger.Named("http")),
 	}
 
+	// Bind the listener up front, so address conflicts are reported before
+	// the startup health check instead of surfacing asynchronously.
+	listener, err := net.Listen("tcp", cmd.addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %v: %w", cmd.addr, err)
+	}
+
+	// serverErr receives the result of httpServer.Serve. Reporting server
+	// errors through a channel (instead of logger.Fatal in the goroutine)
+	// ensures deferred cleanup, e.g. boltDB.Close, is executed.
+	serverErr := make(chan error, 1)
 	go func() {
+		if err := httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}()
+
+	// Startup health check: only announce readiness once the HTTP server
+	// actually responds to requests.
+	if err := waitForHealthy(ctx, url, 10*time.Second); err != nil {
+		mainLogger.Warn("HTTP server failed startup health check.", zap.Error(err))
+	} else {
 		mainLogger.Info(fmt.Sprintf("Hetty (v%v) is running on %v ...", version, cmd.addr))
 		mainLogger.Info(fmt.Sprintf("\x1b[%dm%s\x1b[0m", uint8(32), "Get started at "+url))
-
-		err := httpServer.ListenAndServe()
-		if err != http.ErrServerClosed {
-			mainLogger.Fatal("HTTP server closed unexpected.", zap.Error(err))
-		}
-	}()
+	}
 
 	if cmd.chrome {
 		ctx, cancel := chrome.NewExecAllocator(ctx, chrome.Config{
@@ -283,20 +303,66 @@ func (cmd *HettyCommand) Exec(ctx context.Context, _ []string) error {
 		}
 	}
 
-	// Wait for interrupt signal.
-	<-ctx.Done()
-	// Restore signal, allowing "force quit".
-	stop()
+	// Wait for interrupt signal or an unexpected HTTP server error.
+	select {
+	case <-ctx.Done():
+		// Restore signal, allowing "force quit".
+		stop()
+		mainLogger.Info("Shutting down HTTP server. Press Ctrl+C to force quit.")
+	case err := <-serverErr:
+		if err != nil {
+			return fmt.Errorf("HTTP server closed unexpectedly: %w", err)
+		}
+		return nil
+	}
 
-	mainLogger.Info("Shutting down HTTP server. Press Ctrl+C to force quit.")
-
-	// Note: We expect httpServer.Handler to handle timeouts, thus, we don't
-	// need a context value with deadline here.
 	//nolint:contextcheck
-	err = httpServer.Shutdown(context.Background())
-	if err != nil {
-		return fmt.Errorf("failed to shutdown HTTP server: %w", err)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	shutdownErr := httpServer.Shutdown(shutdownCtx)
+
+	// http.Server.Shutdown does not close hijacked CONNECT tunnel
+	// connections, and idle keep-alive connections in the proxy's transport
+	// are not released automatically. Close the proxy to notify connected
+	// clients and release transport resources.
+	proxyErr := proxy.Close()
+
+	if shutdownErr != nil {
+		return fmt.Errorf("failed to shutdown HTTP server: %w", shutdownErr)
+	}
+	if proxyErr != nil {
+		return fmt.Errorf("failed to close proxy: %w", proxyErr)
 	}
 
 	return nil
+}
+
+// waitForHealthy polls the HTTP server until it responds to a request or
+// the timeout elapses. Any HTTP response, regardless of status code, is
+// considered healthy.
+func waitForHealthy(ctx context.Context, url string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	client := &http.Client{Timeout: time.Second}
+
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return fmt.Errorf("failed to build health check request: %w", err)
+		}
+
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			return nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("server did not become healthy within %v: %w", timeout, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
 }
